@@ -400,12 +400,18 @@ class IndexingKafkaConsumer(IMessagingConsumer):
         renewer, self.lease_renewer = self.lease_renewer, None
         return renewer
 
+    def _stop_taking_work(self) -> None:
+        """Called on the shared loop's thread when it dies: stops reads and dispatch, so nothing
+        more is handed to a loop that cannot run it."""
+        self.running = False
+
     def __start_worker_thread(self) -> None:
         """Start the worker thread with its own event loop, or join the shared worker loop."""
         if self._shared_worker is not None:
             self.worker_loop_ready.clear()
             loop = self._shared_worker.start()
             self.worker_loop = loop
+            self._shared_worker.add_exit_listener(self._stop_taking_work)
             self._shared_worker.call(lambda: self._on_worker_loop_started(loop))
             # Reported once, under the record consumer: every consumer on the loop sees the same lag.
             self.loop_lag_monitor = self._shared_worker.lag_monitor if self.stage_admission is None else None
@@ -519,6 +525,7 @@ class IndexingKafkaConsumer(IMessagingConsumer):
         self._wait_for_active_futures()
         if self._shared_worker is not None:
             # The loop is shared: release only what this consumer started on it.
+            self._shared_worker.remove_exit_listener(self._stop_taking_work)
             if self.worker_loop is not None and self.worker_loop.is_running():
                 renewer = self._shared_worker.call(self._take_lease_renewer)
                 if renewer is not None:
@@ -2693,9 +2700,9 @@ class IndexingKafkaConsumer(IMessagingConsumer):
 
                 async def consume_handler_events() -> None:
                     nonlocal parsing_held, indexing_held, success, shutting_down, parsing_admission, parse_lease_pool
-                    async with asyncio.timeout(processing_timeout) as budget:
-                        event_gen = self.message_handler(parsed_message)
-                        try:
+                    event_gen = self.message_handler(parsed_message)
+                    try:
+                        async with asyncio.timeout(processing_timeout) as budget:
                             async for event in event_gen:
                                 if (
                                     event.event == IndexingEvent.START_PARSING
@@ -2780,15 +2787,21 @@ class IndexingKafkaConsumer(IMessagingConsumer):
                                         f"Released indexing gate for {message_id}"
                                     )
                                     success = True
-                        finally:
-                            # If this coroutine is cancelled (timeout, or the
-                            # renewal-loss path cancelling handler_task below)
-                            # while suspended on the semaphore acquire, the
-                            # CancelledError lands here — not inside the
-                            # handler generator. Explicitly closing it
-                            # delivers GeneratorExit so the handler's own
-                            # cleanup (reverting IN_PROGRESS) still runs.
-                            await event_gen.aclose()
+                                    break
+                        # The record is done once INDEXING_COMPLETE is out; the
+                        # handler's bookkeeping after it (releasing queued copies)
+                        # must not fail a finished record on the processing deadline.
+                        await concurrency.finish_after_indexing_complete(event_gen)
+                    finally:
+                        # Closing delivers GeneratorExit so the handler's own
+                        # cleanup (reverting IN_PROGRESS) runs on every exit,
+                        # including cancellation while parked on a slot. It sits
+                        # outside the timeout so a deadline passing mid-cleanup
+                        # cannot cut that cleanup short, orphan inner generators
+                        # (their GC finalizer then runs in another Context and
+                        # ContextVar.reset fails), or turn the real error into a
+                        # TimeoutError.
+                        await event_gen.aclose()
 
                 handler_task: asyncio.Task[None] | None = None
                 try:

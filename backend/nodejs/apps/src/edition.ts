@@ -21,3 +21,11 @@ export const VECTOR_STORE_REBUILD_AVAILABLE = true;
  * that hold settings rather than secrets, so reads return them as stored.
  */
 export const EXTRA_AI_PUBLIC_CONFIG_KEYS: readonly string[] = [];
+
+/** Sign-in methods this edition does not offer; saved policies that name them are rewritten. */
+export const REMOVED_SIGN_IN_METHODS: readonly string[] = ['samlSso', 'oauth'];
+
+/** Sign-in methods this edition offers under another name. */
+export const RENAMED_SIGN_IN_METHODS: Readonly<Record<string, string>> = {
+  azureAd: 'microsoft',
+};
